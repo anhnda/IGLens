@@ -30,6 +30,29 @@ out of h_L beyond h_{L-1}. It deliberately ignores the effect of h_L routed
 through upper blocks (attention/MLP). That is the price of a clean
 telescoping sum; you cannot have both "total effect via full forward" and
 "sum == delta-prob". This file picks the latter, as requested.
+
+--normalize (IDGI / PACE-Grad-style prediction-aware reweighting)
+-----------------------------------------------------------------
+Borrowing the core idea of IDGI [Yang et al. 2023] and the prediction-aware
+consistency principle of PACE-Grad: a step on the path should be credited in
+proportion to the OBSERVABLE OUTPUT CHANGE Δf it produces, not the raw
+gradient magnitude. Standard IG accumulates <diff, g_s>/n uniformly; this
+over-credits steps where g_s is large but f does not actually move (spurious
+sensitivity in out-of-support regions).
+
+With --normalize ON, the contribution of interior step s of a segment is
+replaced by the true local output change
+
+    Δf_s = f(h_{a_s}) - f(h_{a_{s-1}}),
+
+and the segment value becomes  sum_s Δf_s  (a midpoint-free telescoping of f
+along the segment's interior grid). Because f is a 1-D readout here, the
+IDGI per-dimension redistribution g⊙diff / <g,diff> collapses to a scalar, so
+"normalize" reduces exactly to crediting each step its real Δf. This keeps
+EXACT per-segment completeness (sum_s Δf_s = f(h_end) - f(h_start)) — and in
+fact makes it exact up to float error regardless of n_steps — while killing
+sensitivity-without-response steps. The overall telescoping sum == Δprob is
+preserved either way.
 """
 
 import argparse
@@ -102,13 +125,35 @@ def f_prob(normf, head, h_vec, target_id):
     return F.softmax(logits, dim=-1)[target_id]
 
 
+@torch.no_grad()
+def f_prob_batch(normf, head, h_mat, target_id):
+    """h_mat: [b, d]. Returns prob of target_id per row, [b]. No grad."""
+    logp = F.log_softmax(head(normf(h_mat)), dim=-1)      # [b, V]
+    return logp[:, target_id].exp()                       # [b]
+
+
 # ---------------------------------------------------------------------------
 # Segment IG: integrate f along straight line h_start -> h_end.
 # Returns IG_segment ~= f(h_end) - f(h_start) (completeness on this segment).
+#
+# normalize=False (default): standard IG, <diff, mean_s grad(h_a)>.
+# normalize=True (IDGI/PACE-Grad): credit each interior step its true output
+#   change Δf_s = f(h_{a_s}) - f(h_{a_{s-1}}). For a 1-D readout this is the
+#   exact IDGI redistribution and gives exact segment completeness.
 # ---------------------------------------------------------------------------
 
-def segment_ig(normf, head, h_start, h_end, target_id, n_steps):
+def segment_ig(normf, head, h_start, h_end, target_id, n_steps,
+               normalize=False):
     diff = (h_end - h_start)
+
+    if normalize:
+        # endpoints of the n_steps interior intervals: a = 0, 1/n, ..., 1
+        # crediting each interval its real Δf is a clean telescoping of f.
+        grid = torch.linspace(0.0, 1.0, n_steps + 1, device=h_start.device)
+        pts = h_start.unsqueeze(0) + grid.unsqueeze(1) * diff.unsqueeze(0)  # [n+1, d]
+        fvals = f_prob_batch(normf, head, pts, target_id)                  # [n+1]
+        return float((fvals[1:] - fvals[:-1]).sum().item())
+
     grad_accum = torch.zeros_like(diff)
     for s in range(n_steps):
         a = (s + 0.5) / n_steps                 # midpoint Riemann
@@ -127,10 +172,14 @@ def segment_ig(normf, head, h_start, h_end, target_id, n_steps):
 # (f = norm+head is pointwise on a single hidden vector, no cross-token path),
 # so grad(p.sum()) over the flat batch yields the per-point gradient exactly.
 # Returns ig[T, K]: ig[t, j] is the IG credited to chosen_lo[j] for token t.
+#
+# normalize=True: same prediction-aware reweighting as segment_ig, fully
+#   batched and grad-free — each segment's value is sum_s Δf_s over its
+#   interior grid. Δprob completeness is preserved exactly.
 # ---------------------------------------------------------------------------
 
 def segment_ig_batched(normf, head, starts, ends, target_ids, n_steps,
-                       max_rows=4096):
+                       max_rows=4096, normalize=False):
     """
     starts, ends: [T, K, d]   target_ids: [T] (long)
     Returns ig: [T, K] on CPU-friendly float (same value as segment_ig).
@@ -140,6 +189,30 @@ def segment_ig_batched(normf, head, starts, ends, target_ids, n_steps,
     T, K, d = starts.shape
     device = starts.device
     diff = ends - starts                                  # [T, K, d]
+
+    if normalize:
+        # grid endpoints a = 0 .. 1 with n_steps intervals: [n+1]
+        grid = torch.linspace(0.0, 1.0, n_steps + 1, device=device)        # [n+1]
+        npts = n_steps + 1
+        # all grid points: [T, K, n+1, d] -> flat [T*K*(n+1), d]
+        pts = (starts[:, :, None, :]
+               + grid[None, None, :, None] * diff[:, :, None, :])
+        flat = pts.reshape(-1, d)                          # [N, d]
+        N = flat.size(0)
+        tgt_full = (target_ids[:, None, None]
+                    .expand(T, K, npts).reshape(-1))        # [N]
+
+        f_flat = torch.empty(N, device=device, dtype=flat.dtype)
+        with torch.no_grad():
+            for lo in range(0, N, max_rows):
+                hi = min(lo + max_rows, N)
+                logp = F.log_softmax(head(normf(flat[lo:hi])), dim=-1)
+                rows = torch.arange(hi - lo, device=device)
+                f_flat[lo:hi] = logp[rows, tgt_full[lo:hi]].exp()
+        fvals = f_flat.reshape(T, K, npts)                 # [T, K, n+1]
+        ig = (fvals[:, :, 1:] - fvals[:, :, :-1]).sum(-1)  # [T, K]
+        return ig
+
     a = (torch.arange(n_steps, device=device) + 0.5) / n_steps   # [n]
 
     # all interpolation points: [T, K, n, d] -> flat [T*K*n, d]
@@ -240,7 +313,8 @@ def run(model, tokenizer, sentence, args):
     print()
     print(f"Answer: {tokenizer.decode(answer_ids)!r}")
     print(f"baseline={args.baseline}  n_steps={args.n_steps}  "
-          f"target=prob  onset_frac={args.onset_frac}")
+          f"target=prob  onset_frac={args.onset_frac}  "
+          f"normalize={args.normalize}")
     hdr = f"{'idx':>3}  {'token':<14}"
     for li in chosen_hi:
         hdr += f"{'IG@L'+str(li):>12}{'lens@L'+str(li):>12}"
@@ -271,7 +345,8 @@ def run(model, tokenizer, sentence, args):
 
     # --- one batched backward for every (token, segment) ----------------
     ig_all = segment_ig_batched(
-        normf, head, starts, ends, target_ids, args.n_steps)   # [T, K]
+        normf, head, starts, ends, target_ids, args.n_steps,
+        normalize=args.normalize)                              # [T, K]
 
     # completeness references f(h_final) and f(base), per token, no-grad
     with torch.no_grad():
@@ -309,6 +384,10 @@ def run(model, tokenizer, sentence, args):
           f"(should be ~1e-4..1e-2; if larger, raise --n-steps)")
     print("IG@L  = telescoping segment IG credited to layer L: "
           "f(h_L)-f(h_{prev chosen}); head=norm+lm_head applied ONCE.")
+    if args.normalize:
+        print("normalize=ON: each path step credited its true output change "
+              "Δf (IDGI / PACE-Grad prediction-aware reweighting); "
+              "sensitivity-without-response steps are suppressed.")
     print("sum over chosen layers == prob_i(final) - prob_i(baseline)  (Δprob).")
     print("lens@L = softmax(head(norm(h_L[i])))[y_t]  REFERENCE ONLY.")
     print(f"onsetL* = earliest layer where cumulative |IG| reaches "
@@ -347,6 +426,11 @@ def main():
     ap.add_argument("--onset-frac", type=float, default=0.5,
                     help="onset L* = earliest layer where cumulative |IG| "
                          "reaches this fraction of total mass")
+    ap.add_argument("--normalize", action="store_true",
+                    help="IDGI/PACE-Grad prediction-aware reweighting: credit "
+                         "each path step its true output change Δf instead of "
+                         "the raw gradient (suppresses sensitivity-without-"
+                         "response steps). Δprob completeness preserved.")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--loop", action="store_true")
     args = ap.parse_args()
